@@ -1,7 +1,7 @@
 ﻿using System;
-using System.Collections.Generic;
+// using System.Collections.Generic;
 using System.IO;
-using System.Linq;
+// using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -10,21 +10,21 @@ using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
-using JetBrains.Annotations;
-using Landfall.Haste;
-using Landfall.Haste.Steam;
-using MonoMod.Utils;
+// using JetBrains.Annotations;
+// using Landfall.Haste;
+// using Landfall.Haste.Steam;
+// using MonoMod.Utils;
 using Steamworks;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
-using Unity.Mathematics;
-using Zorro.ControllerSupport;
-using Zorro.Settings;
-using Zorro.Settings.DebugUI;
-using FloatSettingUI = Zorro.Settings.UI.FloatSettingUI;
-using Logger = UnityEngine.Logger;
-using PlatformSelector = Landfall.Haste.PlatformSelector;
+// using Unity.Mathematics;
+// using Zorro.ControllerSupport;
+// using Zorro.Settings;
+// using Zorro.Settings.DebugUI;
+// using FloatSettingUI = Zorro.Settings.UI.FloatSettingUI;
+// using Logger = UnityEngine.Logger;
+// using PlatformSelector = Landfall.Haste.PlatformSelector;
 
 namespace HasteTogether;
 
@@ -39,7 +39,7 @@ public class Plugin : BaseUnityPlugin
 
     public static Transform TogetherUI;
     
-    private async void Awake()
+    private void Awake()
     {
         Logger = base.Logger;
         Patcher.PatchAll();
@@ -48,7 +48,7 @@ public class Plugin : BaseUnityPlugin
         //IPAddress address = IPAddress.Parse("127.0.0.1");
         IPAddress address = IPAddress.Parse("45.133.89.163");
         IPEndPoint endpoint = new(address, 9843);
-        manager = new SocketManager();
+        manager = new SocketManager(endpoint);
         Logger.LogInfo("Connecting to server...");
         
         manager.OnDataReceived += async (byte[] receivedData) =>
@@ -154,7 +154,7 @@ public class Plugin : BaseUnityPlugin
             SimpleRunHandler.currentSeed = 0;
         };
         
-        _ = manager.StartListening(endpoint);
+        _ = manager.StartReceiving();
     }
     
     public static byte[] SerializeTransform(Vector3 position, Quaternion rotation)
@@ -241,90 +241,95 @@ public class Plugin : BaseUnityPlugin
 public class SocketManager
 {
     public Socket client;
+		private IPEndPoint serverEndpoint;
+		private IPEndPoint receiveEndpoint = new IPEndPoint(IPAddress.Any, 0);
     private byte[] buffer = new byte[1024];
 
     public event Action<byte[]> OnDataReceived;
 
-    public SocketManager()
+    public SocketManager(IPEndPoint serverEndpoint)
     {
         client = new Socket(
             AddressFamily.InterNetwork,
-            SocketType.Stream,
-            ProtocolType.Tcp
+            SocketType.Dgram,
+            ProtocolType.Udp
         );
+
+				client.Bind(receiveEndpoint);
+				Plugin.Logger.LogInfo($"Socket bound to local endpoint: {client.LocalEndPoint}");
     }
 
-    public async Task StartListening(IPEndPoint endpoint)
+    public async Task StartReceiving()
     {
         try
         {
-            await client.ConnectAsync(endpoint);
-            Plugin.Logger.LogInfo("Connected!");
-            new NamePacket(SteamFriends.GetPersonaName()).Send();
-            _ = ReceiveLoop(endpoint);
+          // No ConnectAsync for UDP
+					Plugin.Logger.LogInfo($"Ready to send/receive UDP packets to/from {serverEndpoint}");
+					new NamePacket(SteamFriends.GetPersonaName()).Send();
+            _ = ReceiveLoop();
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Connection error: {ex.Message}");
             foreach (NetworkedPlayer plr in GameObject.FindObjectsOfType<NetworkedPlayer>()) GameObject.Destroy(plr.gameObject);
             await Task.Delay(3000);
-            _ = StartListening(endpoint);
+            _ = StartReceiving();
         }
     }
 
-private async Task ReceiveLoop(IPEndPoint endpoint)
+private async Task ReceiveLoop()
 {
     MemoryStream messageBuffer = new MemoryStream();
     while (true)
     {
         try
         {
-            int bytesRead = await client.ReceiveAsync(buffer, SocketFlags.None);
-            if (bytesRead == 0)
+						// Receive data and the sender's endpoint
+						EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+						SocketReceiveFromResult result = await client.ReceiveFromAsync(buffer, SocketFlags.None, remoteEP);
+
+						if (result.ReceivedBytes > 0)
             {
-                Console.WriteLine("Disconnected from server.");
-                await Task.Delay(3000);
-                client.Dispose();
-                client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                _ = StartListening(endpoint);
-                break;
-            }
+								// Optional: Check if the packet came from the expected server
+								// if (!remoteEP.Equals(serverEndpoint)) continue;
 
-            messageBuffer.Write(buffer, 0, bytesRead);
-            
-            while (messageBuffer.Length >= 2)
-            {
-                byte[] lengthBytes = messageBuffer.ToArray().Take(2).ToArray();
-                ushort messageLength = BitConverter.ToUInt16(lengthBytes, 0);
+                // Create a copy of the received data with the correct size
+                byte[] receivedData = new byte[result.ReceivedBytes];
+                Array.Copy(buffer, 0, receivedData, 0, result.ReceivedBytes);
 
-                if (messageBuffer.Length >= messageLength + 2)
-                {
-                    byte[] messageBytes = messageBuffer.ToArray().Skip(2).Take(messageLength).ToArray();
-
-                    OnDataReceived?.Invoke(messageBytes);
-
-                    // Remove processed data
-                    byte[] remaining = messageBuffer.ToArray().Skip(messageLength + 2).ToArray();
-                    messageBuffer.SetLength(0);
-                    messageBuffer.Write(remaining, 0, remaining.Length);
-                }
-                else break;
-            }
+                // Invoke the event handler with the received datagram
+                OnDataReceived?.Invoke(receivedData);
+             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Socket error: {ex.Message}");
+            Console.WriteLine($"Socket receive error: {ex.Message}");
             foreach (NetworkedPlayer plr in GameObject.FindObjectsOfType<NetworkedPlayer>())
                 GameObject.Destroy(plr.gameObject);
             await Task.Delay(3000);
-            client.Dispose();
-            client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _ = StartListening(endpoint);
             break;
         }
     }
 }
 
+// Method to send data using UDP
+public async Task SendAsync(byte[] data)
+{
+    if (client == null || serverEndpoint == null)
+    {
+        Plugin.Logger.LogWarning("Socket or server endpoint not initialized. Cannot send data.");
+        return;
+    }
+    try
+    {
+        await client.SendToAsync(data, SocketFlags.None, serverEndpoint);
+    }
+    catch (Exception ex)
+    {
+        Plugin.Logger.LogError($"Socket send error: {ex.Message}");
+        // Handle send errors if necessary
+    }
+}
 
 }
 
@@ -335,9 +340,11 @@ public class ConnectionState : MonoBehaviour
     public Sprite disconnected;
     void Update()
     {
-        if (Plugin.manager == null || Plugin.manager.client == null || connected == null)
-            return;
-        img.sprite = Plugin.manager.client.Connected ? connected : disconnected;
+        // UDP sockets don't have a persistent 'Connected' state like TCP.
+        // Check if the manager and socket exist as a proxy for 'initialized'.
+        if (Plugin.manager?.client == null || connected == null || disconnected == null)
+             return;
+        img.sprite = connected; // Assume connected if initialized (needs better logic for UDP status)
     }
 }
 
@@ -444,14 +451,14 @@ public abstract class Packet
 
     public void Send()
     {
-        if (Plugin.manager.client == null || !Plugin.manager.client.Connected) return;//throw new Exception("Not connected to a server!");
-        byte[] data = Serialize();
+        if (Plugin.manager?.client == null) return; // Check if manager and socket exist
+        
+				byte[] data = Serialize();
         byte[] toSend = new byte[data.Length+1];
         toSend[0] = PacketID();
         Buffer.BlockCopy(data, 0, toSend, 1, data.Length);
-        byte[] lengthPrefix = BitConverter.GetBytes((ushort)toSend.Length);
-        byte[] fullMessage = lengthPrefix.Concat(toSend).ToArray();
-        Plugin.manager.client.Send(fullMessage);
+				// No length prefix needed for UDP datagrams
+        _ = Plugin.manager.SendAsync(toSend); // Use the new async send method
     }
 }
 
